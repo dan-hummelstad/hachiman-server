@@ -25,3 +25,5 @@ goinstall.log
 *.sqlite
 build/
 .idea/
+/data
+/bin

@@ -1,0 +1,14 @@
+{
+  "name": "hachiman-server",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "build": "go build -o ./bin/hachiman-server mumble.info/grumble/cmd/grumble ",
+    "start": "./bin/hachiman-server --datadir ./bin/data --log ./bin/data/grumble.log",
+    "dev": "pnpm run build && pnpm run start"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.6.3"
+}

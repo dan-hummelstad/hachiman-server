@@ -1483,11 +1483,37 @@ func (server *Server) Start() (err error) {
 		server.webwsl = web.NewListener(webaddr, server.Logger)
 		mux := http.NewServeMux()
 		mux.Handle("/", server.webwsl)
+
+		// Start MCU mixer used by WebRTC handler
+		if err := web.StartMCUMixer(); err != nil {
+			server.Fatalf("unable to start MCU mixer: %v", err)
+		}
+
+		// WebRTC signaling endpoint. Pass small closures for auth and registration so pkg/web does not import main.
+		mux.HandleFunc("/webrtc", func(w http.ResponseWriter, r *http.Request) {
+			web.HandleWebRTCSignal(w, r,
+				// authFn: ensure session exists and is authenticated
+				func(session uint32) bool {
+					server.hmutex.Lock()
+					c, ok := server.clients[session]
+					server.hmutex.Unlock()
+					return ok && c != nil && c.state >= StateClientAuthenticated
+				},
+				// sessionShouldRegister: optional registration hook (no-op here)
+				func(session uint32) {
+					// optionally map session -> created PC/outTrack if you need to control it from server
+				},
+				// sessionShouldUnregister: optional cleanup hook
+				func(session uint32) {
+				},
+			)
+		})
+
 		server.webhttp = &http.Server{
-			Addr:      webaddr.String(),
-			Handler:   mux,
-			TLSConfig: server.webtlscfg,
-			ErrorLog:  server.Logger,
+			Addr:    webaddr.String(),
+			Handler: mux,
+			// TLSConfig: server.webtlscfg,
+			ErrorLog: server.Logger,
 
 			// Set sensible timeouts, in case no reverse proxy is in front of Grumble.
 			// Non-conforming (or malicious) clients may otherwise block indefinitely and cause
@@ -1497,7 +1523,8 @@ func (server *Server) Start() (err error) {
 			IdleTimeout:  2 * time.Minute,
 		}
 		go func() {
-			err := server.webhttp.ListenAndServeTLS("", "")
+			// err := server.webhttp.ListenAndServeTLS("", "")
+			err := server.webhttp.ListenAndServe()
 			if err != http.ErrServerClosed {
 				server.Fatalf("Fatal HTTP server error: %v", err)
 			}

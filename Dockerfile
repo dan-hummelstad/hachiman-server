@@ -1,4 +1,4 @@
-FROM golang:1.14-alpine as builder
+FROM golang:1.25-alpine AS builder
 
 COPY . /go/src/mumble.info/grumble
 
@@ -12,9 +12,9 @@ RUN go get -v -t ./... \
 
 FROM alpine:edge
 
-COPY --from=builder /go/bin/grumble /usr/bin/grumble
+COPY --from=builder /go/src/mumble.info/grumble/grumble /usr/bin/grumble
 
-ENV DATADIR /data
+ENV DATADIR=/data
 
 RUN mkdir /data
 
