@@ -16,11 +16,10 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 	"mumble.info/grumble/pkg/acl"
 	"mumble.info/grumble/pkg/cryptstate"
 	"mumble.info/grumble/pkg/mumbleproto"
-	"mumble.info/grumble/pkg/packetdata"
 )
 
 // A client connection
@@ -56,6 +55,9 @@ type Client struct {
 	TcpPingVar float32
 	TcpPackets uint32
 
+	// Bandwidth Recoreder
+	Bandwidth *BandwidthRecorder
+
 	// If the client is a registered user on the server,
 	// the user field will point to the registration record.
 	user *User
@@ -68,7 +70,7 @@ type Client struct {
 	clientReady chan bool
 
 	// Version
-	Version    uint32
+	Version    ClientVersion
 	ClientName string
 	OSName     string
 	OSVersion  string
@@ -78,6 +80,7 @@ type Client struct {
 	Username        string
 	session         uint32
 	certHash        string
+	certVerified    bool
 	Email           string
 	tokens          []string
 	Channel         *Channel
@@ -90,6 +93,10 @@ type Client struct {
 	Recording       bool
 	PluginContext   []byte
 	PluginIdentity  string
+
+	// RateLimit
+	GlobalLimit *RateLimit
+	PluginLimit *RateLimit
 }
 
 // Debugf implements debug-level printing for Clients.
@@ -105,6 +112,11 @@ func (client *Client) IsRegistered() bool {
 // HasCertificate Does the client have a certificate?
 func (client *Client) HasCertificate() bool {
 	return len(client.certHash) > 0
+}
+
+// IsCertificateValid Is the client has a verified certificate?
+func (client *Client) IsCertificateVerified() bool {
+	return client.certVerified
 }
 
 // IsSuperUser Is the client the SuperUser?
@@ -300,7 +312,7 @@ func (c *Client) sendPermissionDenied(who *Client, where *Channel, what acl.Perm
 }
 
 // Send permission denied fallback
-func (client *Client) sendPermissionDeniedFallback(denyType mumbleproto.PermissionDenied_DenyType, version uint32, text string) {
+func (client *Client) sendPermissionDeniedFallback(denyType mumbleproto.PermissionDenied_DenyType, version ClientVersion, text string) {
 	pd := &mumbleproto.PermissionDenied{
 		Type: denyType.Enum(),
 	}
@@ -323,62 +335,41 @@ func (client *Client) udpRecvLoop() {
 			return
 		}
 
-		kind := (buf[0] >> 5) & 0x07
+		// Limit user bandwidth
+		if !client.Bandwidth.AddFrame(len(buf), client.server.cfg.IntValue("MaxBandwidth")) {
+			client.Printf("user bandwidth reached! pkt size: %d", len(buf))
+			return
+		}
 
-		switch kind {
-		case mumbleproto.UDPMessageVoiceSpeex:
-			fallthrough
-		case mumbleproto.UDPMessageVoiceCELTAlpha:
-			fallthrough
-		case mumbleproto.UDPMessageVoiceCELTBeta:
-			if client.server.Opus {
-				return
+		pkt, legacy := mumbleproto.ParseUDPPacket(buf, !(client.Version.SupportProtobuf() && client.server.Version.SupportProtobuf()))
+		if pkt == nil {
+			client.Printf("unable to parse UDP packet, ignore. %v", buf)
+			return
+		}
+
+		switch v := pkt.(type) {
+		case *mumbleproto.PingPacket:
+			data, err := v.Data(legacy)
+			if err != nil {
+				client.server.Panicf("Unable to encode UDP message: %v", err.Error())
 			}
-			fallthrough
-		case mumbleproto.UDPMessageVoiceOpus:
-			target := buf[0] & 0x1f
-			var counter uint8
-			outbuf := make([]byte, 1024)
-
-			incoming := packetdata.New(buf[1 : 1+(len(buf)-1)])
-			outgoing := packetdata.New(outbuf[1 : 1+(len(outbuf)-1)])
-			_ = incoming.GetUint32()
-
-			if kind != mumbleproto.UDPMessageVoiceOpus {
-				for {
-					counter = incoming.Next8()
-					incoming.Skip(int(counter & 0x7f))
-					if !((counter&0x80) != 0 && incoming.IsValid()) {
-						break
-					}
-				}
-			} else {
-				size := int(incoming.GetUint16())
-				incoming.Skip(size & 0x1fff)
+			err = client.SendUDP(data)
+			if err != nil {
+				client.Panicf("Unable to send UDP message: %v", err.Error())
 			}
-
-			outgoing.PutUint32(client.Session())
-			outgoing.PutBytes(buf[1 : 1+(len(buf)-1)])
-			outbuf[0] = buf[0] & 0xe0 // strip target
-
-			if target != 0x1f { // VoiceTarget
-				client.server.voicebroadcast <- &VoiceBroadcast{
-					client: client,
-					buf:    outbuf[0 : 1+outgoing.Size()],
-					target: target,
+		case *mumbleproto.AudioPacket:
+			v.SetSenderSession(client.session)
+			if v.TargetOrContext == uint8(mumbleproto.TargetServerLoopback) { // Server loopback
+				data, err := v.Data(legacy)
+				if err != nil {
+					client.server.Panicf("Unable to encode UDP message: %v", err.Error())
 				}
-			} else { // Server loopback
-				buf := outbuf[0 : 1+outgoing.Size()]
-				err := client.SendUDP(buf)
+				err = client.SendUDP(data)
 				if err != nil {
 					client.Panicf("Unable to send UDP message: %v", err.Error())
 				}
-			}
-
-		case mumbleproto.UDPMessagePing:
-			err := client.SendUDP(buf)
-			if err != nil {
-				client.Panicf("Unable to send UDP message: %v", err.Error())
+			} else {
+				client.server.voicebroadcast <- NewVoiceBroadcast(client, v)
 			}
 		}
 	}
@@ -395,7 +386,6 @@ func (client *Client) SendUDP(buf []byte) error {
 	} else {
 		return client.sendMessage(buf)
 	}
-	panic("unreachable")
 }
 
 // Send a Message to the client.  The Message in msg to the client's
@@ -469,6 +459,7 @@ func (client *Client) tlsRecvLoop() {
 				client.udp = false
 				client.udprecv <- msg.buf
 			} else {
+				client.Bandwidth.ResetIdleSeconds()
 				client.server.incoming <- msg
 			}
 		}
@@ -506,7 +497,8 @@ func (client *Client) tlsRecvLoop() {
 		// what version of the protocol it should speak.
 		if client.state == StateClientConnected {
 			version := &mumbleproto.Version{
-				Version:     proto.Uint32(0x10205),
+				VersionV1:   proto.Uint32(client.server.Version.VersionV1()),
+				VersionV2:   proto.Uint64(client.server.Version.VersionV2()),
 				Release:     proto.String("Grumble"),
 				CryptoModes: cryptstate.SupportedModes(),
 			}
@@ -528,57 +520,7 @@ func (client *Client) tlsRecvLoop() {
 				return
 			}
 
-			version := &mumbleproto.Version{}
-			err = proto.Unmarshal(msg.buf, version)
-			if err != nil {
-				client.Panicf("%v", err)
-				return
-			}
-
-			if version.Version != nil {
-				client.Version = *version.Version
-			} else {
-				client.Version = 0x10200
-			}
-
-			if version.Release != nil {
-				client.ClientName = *version.Release
-			}
-
-			if version.Os != nil {
-				client.OSName = *version.Os
-			}
-
-			if version.OsVersion != nil {
-				client.OSVersion = *version.OsVersion
-			}
-
-			// Extract the client's supported crypto mode.
-			// If the client does not pick a crypto mode
-			// itself, use an invalid mode (the empty string)
-			// as its requested mode. This is effectively
-			// a flag asking for the default crypto mode.
-			requestedMode := ""
-			if len(version.CryptoModes) > 0 {
-				requestedMode = version.CryptoModes[0]
-			}
-
-			// Check if the requested crypto mode is supported
-			// by us. If not, fall back to the default crypto
-			// mode.
-			supportedModes := cryptstate.SupportedModes()
-			ok := false
-			for _, mode := range supportedModes {
-				if requestedMode == mode {
-					ok = true
-					break
-				}
-			}
-			if !ok {
-				requestedMode = "OCB2-AES128"
-			}
-
-			client.CryptoMode = requestedMode
+			client.server.handleVersionMessage(client, msg)
 			client.state = StateClientSentVersion
 		}
 	}
@@ -598,7 +540,7 @@ func (client *Client) sendChannelTree(channel *Channel) {
 	}
 
 	if channel.HasDescription() {
-		if client.Version >= 0x10202 {
+		if client.Version.SupportDescBlobHash() {
 			chanstate.DescriptionHash = channel.DescriptionBlobHashBytes()
 		} else {
 			buf, err := blobStore.Get(channel.DescriptionBlob)
@@ -616,7 +558,7 @@ func (client *Client) sendChannelTree(channel *Channel) {
 	chanstate.Position = proto.Int32(int32(channel.Position))
 
 	links := []uint32{}
-	for cid, _ := range channel.Links {
+	for cid := range channel.Links {
 		links = append(links, uint32(cid))
 	}
 	chanstate.Links = links

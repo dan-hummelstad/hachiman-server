@@ -27,3 +27,5 @@ build/
 .idea/
 /data
 /bin
+
+*.patch
